@@ -612,6 +612,11 @@ bool RH_RF69::send(const uint8_t* data, uint8_t len)
     return true;
 }
 
+bool RH_RF69::sendto(const uint8_t* data, uint8_t len, uint8_t address) {
+    setHeaderTo(address);
+    return send(data, len);
+}
+
 uint8_t RH_RF69::maxMessageLength()
 {
     return RH_RF69_MAX_MESSAGE_LEN;
