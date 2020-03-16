@@ -224,7 +224,8 @@ void RH_RF69::handleInterrupt()
 	_lastRssi = -((int8_t)(spiRead(RH_RF69_REG_24_RSSIVALUE) >> 1));
 	_lastPreambleTime = millis();
 
-	setModeIdle();
+    // MM - don't turn the radio to idle upon receipt of a packet
+	// setModeIdle();
 	// Save it in our buffer
 	readFifo();
 //	Serial.println("PAYLOADREADY");
@@ -242,24 +243,44 @@ void RH_RF69::readFifo()
     _spi.beginTransaction();
     _spi.transfer(RH_RF69_REG_00_FIFO); // Send the start address with the write mask off
     uint8_t payloadlen = _spi.transfer(0); // First byte is payload len (counting the headers)
+    // MM - significant changes to the remainder of this function
+    // to extract a packet from the FIFO and write it to the ring buffer
+    _rxHeaderTo = _spi.transfer(0); // second byte is the destination
     if (payloadlen <= RH_RF69_MAX_ENCRYPTABLE_PAYLOAD_LEN &&
 	payloadlen >= RH_RF69_HEADER_LEN)
     {
-	_rxHeaderTo = _spi.transfer(0);
-	// Check addressing
+    // create a stack local buffer packet that will get 
+    // copied into the ring buffer if the packet is in fact
+    // addressed to us (or broadcast)
+
+    // note that for receiving while this ISR is running to work,
+    // we need to remove the entire packet from the FIFO even if
+    // we're going to throw it away because of addressing
+    BufferPacket recvBuf;
+
+    // Get the rest of the headers
+    recvBuf.rxHeaderTo = _rxHeaderTo;
+    recvBuf.rxHeaderFrom  = _spi.transfer(0);
+    recvBuf.rxHeaderId       = _spi.transfer(0);
+    recvBuf.rxHeaderFlags = _spi.transfer(0);
+    
+    // And now the real payload
+    for (recvBuf.payloadLen = 0; recvBuf.payloadLen < (payloadlen - RH_RF69_HEADER_LEN); recvBuf.payloadLen++) {
+        recvBuf.payload[recvBuf.payloadLen] = _spi.transfer(0);
+    }
+
+    // Check addressing and add the packet to the buffer 
+    // if it's for us
 	if (_promiscuous ||
 	    _rxHeaderTo == _thisAddress ||
 	    _rxHeaderTo == RH_BROADCAST_ADDRESS)
 	{
-	    // Get the rest of the headers
-	    _rxHeaderFrom  = _spi.transfer(0);
-	    _rxHeaderId    = _spi.transfer(0);
-	    _rxHeaderFlags = _spi.transfer(0);
-	    // And now the real payload
-	    for (_bufLen = 0; _bufLen < (payloadlen - RH_RF69_HEADER_LEN); _bufLen++)
-		_buf[_bufLen] = _spi.transfer(0);
 	    _rxGood++;
-	    _rxBufValid = true;
+        _overflow = !_buf.push(&recvBuf);
+        _rxHeaderFrom = recvBuf.rxHeaderFrom;
+        _rxHeaderId = recvBuf.rxHeaderId;
+        _rxHeaderFlags = recvBuf.rxHeaderFlags;
+	    // _rxBufValid = true;
 	}
     }
     digitalWrite(_slaveSelectPin, HIGH);
@@ -308,6 +329,18 @@ bool RH_RF69::setFrequency(float centre, float afcPullInRange)
     // afcPullInRange is not used
     (void)afcPullInRange;
     return true;
+}
+
+// MM - override setThisAddress to pass the address
+// along to the radio so hardware addressing can be
+// used if desired
+void RH_RF69::setThisAddress(uint8_t thisAddress) {
+    // pass along to the base class
+    RHSPIDriver::setThisAddress(thisAddress);
+    // set the address and broadcast address in the radio
+    // register so hardware addressing can be used
+    spiWrite(RH_RF69_REG_39_NODEADRS, thisAddress);
+    spiWrite(RH_RF69_REG_3A_BROADCASTADRS, RH_BROADCAST_ADDRESS);
 }
 
 int8_t RH_RF69::rssiRead()
@@ -497,25 +530,56 @@ bool RH_RF69::available()
     if (_mode == RHModeTx)
 	return false;
     setModeRx(); // Make sure we are receiving
-    return _rxBufValid;
+    // MM - available is now defined as packets being in the buffer
+    return !_buf.isEmpty();
+    // return _rxBufValid;
 }
 
-bool RH_RF69::recv(uint8_t* buf, uint8_t* len)
-{
-    if (!available())
-	return false;
+// MM recv is now just a way to call a new recvfrom method and not 
+// request the addressing info. The buffer model would substantially
+// change the relationship between the driver and manager layer of 
+// RadioHead and I didn't want to take on refactoring that.
+bool RH_RF69::recv(uint8_t* buf, uint8_t* len) {
+    return recvfrom(buf, len);
+}
 
+// MM - this is roughly the equivalent of the old recv method, but
+// it reads packets from the ring buffer rather than the single
+// buffered packet prior
+bool RH_RF69::recvfrom(uint8_t* buf, uint8_t* len, uint8_t* from, uint8_t* to, uint8_t* id, uint8_t* flags)
+{
+    // MM - no point in calling available anymore, if the buffer
+    // isempty the pop will fail
+    // if (!available())
+	// return false;
+
+    // make sure receive is on
+    setModeRx();
+
+    bool hasPacket = false;
     if (buf && len)
     {
 	ATOMIC_BLOCK_START;
-	if (*len > _bufLen)
-	    *len = _bufLen;
-	memcpy(buf, _buf, *len);
+    // would be nice to find a way to do this without
+    // an intermediate buffer (ie, with one copy)
+    BufferPacket packet;
+    hasPacket = _buf.pop(packet); 
+    
+    if (hasPacket) {
+        if (*len > packet.payloadLen) {
+            *len = packet.payloadLen;
+            memcpy(buf, packet.payload, *len);
+            if (from) *from = packet.rxHeaderFrom;
+            if (to) *to = packet.rxHeaderTo;
+            if (id) *id = packet.rxHeaderId;
+            if (flags) *flags = packet.rxHeaderFlags;
+        } else hasPacket = false;
+    }
 	ATOMIC_BLOCK_END;
     }
-    _rxBufValid = false; // Got the most recent message
+    // _rxBufValid = false; // Got the most recent message
 //    printBuffer("recv:", buf, *len);
-    return true;
+    return hasPacket;
 }
 
 bool RH_RF69::send(const uint8_t* data, uint8_t len)

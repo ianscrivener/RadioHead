@@ -6,11 +6,26 @@
 ///
 
 
+//
+// MM - Modified by Matt More (matt@moore-fam.com) to improve reception
+// performance in the presence of a high packet-rate, by:
+//
+// - adding a ring buffer of packets so more than one can be buffered
+// - not turning the radio from recv mode to idle in the interrupt
+//   handler, to allow it to receive a packet received immediately
+//   on the heels of a prior packet.
+// - passing the node address along to the radio so hardware
+//   addressing can be used
+//
+
 #ifndef RH_RF69_h
 #define RH_RF69_h
 
 #include <RHGenericSPI.h>
 #include <RHSPIDriver.h>
+// MM - this ring buffer used for my modifications is this one:
+// https://github.com/Locoduino/RingBuffer
+#include <RingBuf.h>
 
 // The crystal oscillator frequency of the RF69 module
 #define RH_RF69_FXOSC 32000000.0
@@ -846,6 +861,9 @@ public:
     /// \return true if a valid message was copied to buf
     bool        recv(uint8_t* buf, uint8_t* len);
 
+    // MM - recv but return the addressing information
+    bool        recvfrom(uint8_t* buf, uint8_t* len, uint8_t* from = NULL, uint8_t* to = NULL, uint8_t* id = NULL, uint8_t* flags = NULL);
+
     /// Waits until any previous transmit packet is finished being transmitted with waitPacketSent().
     /// Then loads a message into the transmitter and starts the transmitter. Note that a message length
     /// of 0 is NOT permitted. 
@@ -853,6 +871,15 @@ public:
     /// \param[in] len Number of bytes of data to send (> 0)
     /// \return true if the message length was valid and it was correctly queued for transmit
     bool        send(const uint8_t* data, uint8_t len);
+
+    // MM an addressed send. This breaks the driver/manager abstraction
+    // but refactoring that in the presence of the ring buffer is a 
+    // bigger project.
+    bool        sendto(const uint8_t* data, uint8_t len, uint8_t address);
+    
+    // MM override the base class implementation to pass the address
+    // to the radio's hardware
+    void        setThisAddress(uint8_t thisAddress);
 
     /// Sets the length of the preamble
     /// in bytes. 
@@ -966,16 +993,36 @@ protected:
     int8_t              _power;
 
     /// The message length in _buf
-    volatile uint8_t    _bufLen;
+    // MM - using ring buffer instead
+    // volatile uint8_t    _bufLen;
 
     /// Array of octets of teh last received message or the next to transmit message
-    uint8_t             _buf[RH_RF69_MAX_MESSAGE_LEN];
+    // uint8_t             _buf[RH_RF69_MAX_MESSAGE_LEN];
 
     /// True when there is a valid message in the Rx buffer
-    volatile bool    _rxBufValid;
+    // MM - now determined by checked the ring buffer for a packet
+    // volatile bool    _rxBufValid;
 
     /// Time in millis since the last preamble was received (and the last time the RSSI was measured)
     uint32_t            _lastPreambleTime;
+
+    // MM - a struct and ring buffer for buffering packets
+    struct BufferPacket {
+        uint8_t payloadLen;
+        uint8_t rxHeaderTo;
+        uint8_t rxHeaderFrom;
+        uint8_t rxHeaderId;
+        uint8_t rxHeaderFlags;
+        uint8_t payload[RH_RF69_MAX_MESSAGE_LEN];
+    };
+
+    // MM a ring buffer that holds packets that have been
+    // received from the RF69 but not yet delivered to application code
+    RingBuf<struct BufferPacket, 16> _buf;
+
+    // MM true if the last attempt to add a packet to the buffer
+    // resulted in overflow
+    volatile bool _overflow;
 };
 
 /// @example rf69_client.pde
